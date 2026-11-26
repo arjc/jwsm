@@ -1,5 +1,6 @@
 # Jibesh Web Server Monk (JWSM) v2.1
 
+### HOST YOUR OWN SERVER TODAY!!!
 A small Bash CLI and guided setup tool for Debian-based Linux machines. JWSM configures Nginx to serve a website on a loopback-only port and can use Tailscale Funnel to publish it over HTTPS.
 
 > **Public exposure warning:** Tailscale Funnel can make your website reachable by anyone on the internet. Review the content you are serving before running `jib pub`.
