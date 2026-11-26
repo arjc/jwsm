@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# Jibesh Web Server Monk CLI v2.1
+set -Eeuo pipefail
+
+VERSION="2.1"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/jwsm"
+CONFIG_FILE="${CONFIG_DIR}/config"
+LIB_DIR="${HOME}/.local/lib/jwsm"
+SETUP_SCRIPT="${LIB_DIR}/setup.sh"
+
+BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+CYAN=$'\033[36m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RED=$'\033[31m'
+
+banner() {
+  printf "\n${CYAN}╔══════════════════════════════════════════════════════════╗${RESET}\n"
+  printf "${CYAN}║${RESET}  ${BOLD}JIBESH WEB SERVER MONK${RESET}  ${DIM}v${VERSION}${RESET}                         ${CYAN}║${RESET}\n"
+  printf "${CYAN}║${RESET}  Your server. Your rules. Your internet.                  ${CYAN}║${RESET}\n"
+  printf "${CYAN}╚══════════════════════════════════════════════════════════╝${RESET}\n"
+}
+info() { printf "  %s\n" "$*"; }
+ok() { printf "  ${GREEN}✓${RESET} %s\n" "$*"; }
+warn() { printf "  ${YELLOW}!${RESET} %s\n" "$*"; }
+err() { printf "  ${RED}✗${RESET} %s\n" "$*" >&2; }
+need_config() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    err "Jib configuration is missing. Run: jib setup"
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+}
+need_root() {
+  if [[ "$EUID" -ne 0 ]]; then
+    err "This operation needs administrator privileges. Re-run it with sudo where instructed."
+    exit 1
+  fi
+}
+usage() {
+  cat <<'HELP'
+Usage: jib [command]
+
+Commands:
+  (no command)       Open the Jib menu
+  setup              Configure this machine as a web server
+  install nginx      Offer to install Nginx
+  install tailscale  Show official Tailscale installation guidance
+  pub                Publish the configured site with Tailscale Funnel
+  stop               Disable public Funnel access
+  status             Show Nginx, Tailscale and Funnel status
+  update             Pull and deploy the configured Git repository
+  config             Show the current Jib configuration
+  doctor             Diagnose common setup problems
+  uninstall          Remove Jib files (does not remove Nginx/Tailscale)
+
+Notes:
+  - Funnel makes your service publicly reachable. Read the confirmation carefully.
+  - Jib uses a local Nginx listener on 127.0.0.1:WEB_PORT (default 8080).
+HELP
+}
+confirm() {
+  local answer
+  read -r -p "  $1 [y/N] " answer || true
+  [[ "$answer" =~ ^([Yy]|[Yy][Ee][Ss])$ ]]
+}
+run_setup() {
+  [[ -x "$SETUP_SCRIPT" ]] || chmod +x "$SETUP_SCRIPT" 2>/dev/null || true
+  [[ -f "$SETUP_SCRIPT" ]] || { err "Setup wizard not found at $SETUP_SCRIPT. Reinstall Jib."; exit 1; }
+  bash "$SETUP_SCRIPT"
+}
+install_nginx() {
+  command -v apt-get >/dev/null 2>&1 || { err "This installer currently supports apt-based systems."; exit 1; }
+  if command -v nginx >/dev/null 2>&1; then ok "Nginx is already installed."; return; fi
+  warn "This will install Nginx using your distribution's APT repositories."
+  confirm "Install Nginx now?" || return 0
+  sudo apt-get update
+  sudo apt-get install -y nginx
+  sudo systemctl enable --now nginx
+  ok "Nginx installed and started."
+}
+install_tailscale() {
+  if command -v tailscale >/dev/null 2>&1; then ok "Tailscale is already installed."; return; fi
+  warn "Tailscale is not installed."
+  info "Official instructions: https://tailscale.com/download/linux"
+  info "The official convenience installer is: curl -fsSL https://tailscale.com/install.sh | sh"
+  info "Review the script and Tailscale's documentation before running it."
+  if confirm "Open the official download page in your browser (if xdg-open is available)?"; then
+    if command -v xdg-open >/dev/null 2>&1; then xdg-open "https://tailscale.com/download/linux" >/dev/null 2>&1 &
+    else info "Visit https://tailscale.com/download/linux"; fi
+  fi
+}
+publish() {
+  need_config
+  command -v tailscale >/dev/null 2>&1 || { err "Tailscale is missing. Run: jib install tailscale"; exit 1; }
+  command -v nginx >/dev/null 2>&1 || { err "Nginx is missing. Run: jib install nginx"; exit 1; }
+  sudo systemctl is-active --quiet nginx || { err "Nginx is not running. Try: sudo systemctl start nginx"; exit 1; }
+  tailscale status >/dev/null 2>&1 || { err "This device is not connected to your tailnet. Run: sudo tailscale up"; exit 1; }
+  printf "\n"
+  warn "PUBLIC ACCESS WARNING"
+  info "Tailscale Funnel can make this website reachable by anyone on the internet."
+  info "Website root: ${WEB_ROOT}"
+  info "Local target: http://127.0.0.1:${WEB_PORT}"
+  info "Do not publish private files or sensitive dashboards."
+  confirm "Enable Tailscale Funnel now?" || { info "No changes made."; return 0; }
+  tailscale funnel --bg "http://127.0.0.1:${WEB_PORT}"
+  ok "Funnel command submitted."
+  info "Check the assigned URL with: jib status"
+}
+stop_public() {
+  command -v tailscale >/dev/null 2>&1 || { err "Tailscale is not installed."; exit 1; }
+  warn "This disables the HTTPS Funnel service on port 443 for this device."
+  if confirm "Stop public access?"; then
+    tailscale funnel --https=443 off
+    ok "Funnel disabled. Nginx remains running locally."
+  fi
+}
+status() {
+  need_config
+  printf "\n"
+  info "Jib version : ${VERSION}"
+  info "Website root: ${WEB_ROOT}"
+  info "Local port  : ${WEB_PORT}"
+  if command -v nginx >/dev/null 2>&1; then
+    if systemctl is-active --quiet nginx; then ok "Nginx is running"; else warn "Nginx is installed but not running"; fi
+  else warn "Nginx is not installed"; fi
+  if command -v tailscale >/dev/null 2>&1; then
+    if tailscale status >/dev/null 2>&1; then
+      ok "Tailscale is connected"
+      tailscale funnel status 2>&1 || true
+    else warn "Tailscale is installed but not connected"; fi
+  else warn "Tailscale is not installed"; fi
+}
+show_config() {
+  need_config
+  printf "\n"
+  info "Configuration: ${CONFIG_FILE}"
+  info "WEB_ROOT=${WEB_ROOT}"
+  info "WEB_PORT=${WEB_PORT}"
+  info "GIT_REPO=${GIT_REPO:-<not configured>}"
+  info "GIT_BRANCH=${GIT_BRANCH:-main}"
+}
+doctor() {
+  need_config
+  printf "\n"
+  info "Jib Doctor — checking your server..."
+  command -v nginx >/dev/null 2>&1 && ok "Nginx binary found" || warn "Nginx missing"
+  command -v tailscale >/dev/null 2>&1 && ok "Tailscale binary found" || warn "Tailscale missing"
+  command -v git >/dev/null 2>&1 && ok "Git found" || warn "Git missing (needed for jib update)"
+  [[ -d "$WEB_ROOT" ]] && ok "Website directory exists: $WEB_ROOT" || warn "Website directory missing: $WEB_ROOT"
+  [[ -r "$WEB_ROOT" ]] && ok "Website directory readable by current user" || warn "Website directory is not readable by current user"
+  if command -v nginx >/dev/null 2>&1; then sudo nginx -t 2>&1 || warn "Nginx configuration test failed"; fi
+  if command -v tailscale >/dev/null 2>&1; then tailscale status 2>&1 | head -n 12 || true; fi
+}
+update_site() {
+  need_config
+  [[ -n "${GIT_REPO:-}" ]] || { err "No Git repository configured. Run: jib setup"; exit 1; }
+  command -v git >/dev/null 2>&1 || { err "Git is required. Install it with: sudo apt install git"; exit 1; }
+  command -v rsync >/dev/null 2>&1 || { err "rsync is required. Install it with: sudo apt install rsync"; exit 1; }
+  local repo_dir="${HOME}/.local/share/jwsm/repository"
+  mkdir -p "$(dirname "$repo_dir")"
+  if [[ -d "${repo_dir}/.git" ]]; then
+    git -C "$repo_dir" fetch --prune
+    git -C "$repo_dir" checkout "$GIT_BRANCH"
+    git -C "$repo_dir" pull --ff-only origin "$GIT_BRANCH"
+  else
+    git clone --branch "$GIT_BRANCH" --single-branch "$GIT_REPO" "$repo_dir"
+  fi
+  warn "Deployment will synchronize repository files into ${WEB_ROOT}."
+  info "The .git directory and /public/ directory are excluded."
+  confirm "Deploy these files?" || return 0
+  sudo rsync -av --delete --exclude='/.git/' --exclude='/public/' "${repo_dir}/" "${WEB_ROOT}/"
+  sudo nginx -t
+  sudo systemctl reload nginx
+  ok "Website deployed."
+}
+uninstall_jib() {
+  warn "This removes Jib's own files and configuration only."
+  info "Nginx, Tailscale, website files and repositories will be left untouched."
+  confirm "Uninstall Jib?" || return 0
+  rm -f "${HOME}/.local/bin/jib"
+  rm -rf "${HOME}/.local/lib/jwsm" "$CONFIG_DIR"
+  ok "Jib files removed."
+  warn "If you added Jib's PATH line to ~/.bashrc or ~/.profile, you may remove it manually."
+}
+menu() {
+  while true; do
+    banner
+    cat <<'MENU'
+  [1] Setup this server
+  [2] Publish website
+  [3] Stop public access
+  [4] Server status
+  [5] Deploy website from Git
+  [6] Diagnose server
+  [7] Configuration
+  [0] Exit
+
+MENU
+    read -r -p "  Choose an option: " choice || exit 0
+    case "$choice" in
+      1) run_setup ;;
+      2) publish ;;
+      3) stop_public ;;
+      4) status ;;
+      5) update_site ;;
+      6) doctor ;;
+      7) show_config ;;
+      0) exit 0 ;;
+      *) warn "Unknown option." ;;
+    esac
+    printf "\n"
+    read -r -p "  Press Enter to continue..." _ || true
+  done
+}
+
+cmd="${1:-menu}"
+case "$cmd" in
+  menu) menu ;;
+  setup) run_setup ;;
+  install)
+    case "${2:-}" in nginx) install_nginx ;; tailscale) install_tailscale ;; *) usage; exit 2 ;; esac ;;
+  pub) publish ;;
+  stop) stop_public ;;
+  status) status ;;
+  update) update_site ;;
+  config) show_config ;;
+  doctor) doctor ;;
+  uninstall) uninstall_jib ;;
+  -h|--help|help) usage ;;
+  -v|--version|version) printf 'Jibesh Web Server Monk v%s\n' "$VERSION" ;;
+  *) err "Unknown command: $cmd"; usage; exit 2 ;;
+esac
